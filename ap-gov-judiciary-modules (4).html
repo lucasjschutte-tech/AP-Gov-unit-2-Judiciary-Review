@@ -2282,11 +2282,11 @@
   }
 
   function renderFRQFeedback(r) {
-    document.getElementById('frqLoadingMsg').style.display = 'none';
-    document.getElementById('frqFeedbackContent').style.display = 'block';
-
     const pct = r.totalScore / r.maxScore;
     const cls = pct >= 0.8 ? 'good' : pct >= 0.5 ? 'mid' : 'low';
+    const sourceBadge = r._source === 'ai'
+      ? `<span style="font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:0.12em;padding:3px 8px;background:#1a3a5c;color:white;text-transform:uppercase;">⚡ AI Graded</span>`
+      : `<span style="font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:0.12em;padding:3px 8px;background:var(--ink);color:#aaa;text-transform:uppercase;">📋 Rubric Graded</span>`;
 
     document.getElementById('frqScoreRow').innerHTML = `
       <div class="frq-score-box ${cls}">
@@ -2304,7 +2304,8 @@
       <div class="frq-score-box ${r.scoreC>=1?(r.scoreC===2?'good':'mid'):'low'}">
         <div class="score-num">${r.scoreC}/2</div>
         <div class="score-label">Part C</div>
-      </div>`;
+      </div>
+      <div style="display:flex;align-items:flex-end;padding-bottom:4px;">${sourceBadge}</div>`;
 
     document.getElementById('frqFeedbackText').innerHTML = `
       <div style="margin-bottom:18px;">
@@ -2341,85 +2342,460 @@
     document.getElementById('frqFeedbackArea').style.display = 'none';
   }
 
-  // ── CASE EXPLORER ──────────────────────────────────────────────────────────
-  let caseConversationHistory = [];
-  let lastCaseContext = '';
+  // ── OFFLINE FRQ GRADER ─────────────────────────────────────────────────────
+  async function gradeFRQ() {
+    const answer = document.getElementById('frqStudentAnswer').value.trim();
+    if (!answer || answer.split(/\s+/).filter(Boolean).length < 15) {
+      alert('Please write a more complete response before grading (at least a few sentences).');
+      return;
+    }
+    const prompt = frqPrompts[selectedFRQ];
+    document.getElementById('frqFeedbackArea').style.display = 'block';
+    document.getElementById('frqLoadingMsg').style.display = 'block';
+    document.getElementById('frqLoadingMsg').className = 'ai-loading';
+    document.getElementById('frqFeedbackContent').style.display = 'none';
+    document.getElementById('frqSubmitBtn').disabled = true;
+
+    // Try AI if online, fall back to offline rubric
+    if (navigator.onLine) {
+      document.getElementById('frqLoadingMsg').textContent = '⚡ Using AI grading...';
+      try {
+        const systemPrompt = `You are an AP US Government & Politics FRQ grader. Grade student responses against College Board rubric criteria. Be specific, constructive, and encouraging. Always respond ONLY with valid JSON — no markdown, no backticks, no preamble.`;
+        const userMsg = `FRQ PROMPT:\n${prompt.text}\n\nSTUDENT RESPONSE:\n${answer}\n\nGrade this and return ONLY this JSON:\n{"scoreA":<0 or 1>,"scoreB":<0-2>,"scoreC":<0-2>,"totalScore":<0-5>,"maxScore":5,"partAFeedback":"...","partBFeedback":"...","partCFeedback":"...","strengths":"...","improvements":"...","apTip":"..."}`;
+        const res = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-20250514', max_tokens: 1000,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userMsg }]
+          })
+        });
+        if (!res.ok) throw new Error('API error');
+        const data = await res.json();
+        const raw = data.content.map(b => b.text || '').join('');
+        const clean = raw.replace(/```json|```/g, '').trim();
+        const result = JSON.parse(clean);
+        result._source = 'ai';
+        renderFRQFeedback(result);
+        document.getElementById('frqLoadingMsg').style.display = 'none';
+        document.getElementById('frqFeedbackContent').style.display = 'block';
+        document.getElementById('frqSubmitBtn').disabled = false;
+        return;
+      } catch(e) {
+        // Fall through to offline grader
+      }
+    }
+
+    // Offline fallback
+    document.getElementById('frqLoadingMsg').textContent = 'Analyzing your response against AP scoring criteria...';
+    await new Promise(r => setTimeout(r, 700));
+    const result = scoreOfflineFRQ(selectedFRQ, answer);
+    result._source = 'offline';
+    renderFRQFeedback(result);
+    document.getElementById('frqLoadingMsg').style.display = 'none';
+    document.getElementById('frqFeedbackContent').style.display = 'block';
+    document.getElementById('frqSubmitBtn').disabled = false;
+  }
+
+  // Offline rubric-based scoring
+  const frqRubrics = [
+    { // 0 - Judicial Review
+      partA: {
+        keywords: [['judicial review','power to strike down','declare unconstitutional','court to invalidate'],['marbury','1803','marshall']],
+        hint: 'Part A requires (1) a definition of judicial review AND (2) naming Marbury v. Madison (1803). Make sure both are clearly stated.',
+        full: 'Strong work on Part A — you correctly defined judicial review and identified Marbury v. Madison (1803) as the establishing case.',
+        partial: 'You addressed part of Part A. To earn full credit, you need both: a clear definition of judicial review AND an explicit identification of Marbury v. Madison (1803).',
+        miss: 'Part A: Define judicial review as the power of courts to examine laws/actions and declare them unconstitutional, then identify Marbury v. Madison (1803) as the case that established it.'
+      },
+      partB: {
+        keywordsFor: [['protect','minority','rights','individual','tyranny of majority','majority rule','constitution','fundamental','civil liberties']],
+        keywordsAgainst: [['unelected','counter-majoritarian','anti-democratic','no electoral','life tenure','democratic majority','will of the people','elected representatives']],
+        hint: 'Part B needs TWO distinct arguments — one FOR (protects rights/minority from majority) and one AGAINST (unelected judges override democratic majorities). Label each clearly.',
+        full: 'Excellent Part B — you clearly articulated both the pro-democracy argument (protecting minority rights/individual liberties from majority tyranny) and the anti-democratic critique (unelected, life-tenured judges overriding elected officials).',
+        partial: 'You made one strong argument in Part B but the second argument needs more development. Clearly label and distinguish both perspectives — one defending judicial review as protective of rights, one critiquing it as counter-majoritarian.',
+        miss: 'Part B: PRO: Judicial review protects individual/minority rights from majority tyranny — democracy requires more than majority rule. CON: Unelected life-tenured judges can strike down laws passed by democratically elected officials — this is counter-majoritarian.'
+      },
+      partC: {
+        keywords: [['article iii','life tenure','good behavior','salary','appointment','confirmation','senate','advice and consent','checks','independence'],['balance','democratic','accountability','elected','amendment','jurisdiction']],
+        hint: 'Part C should discuss specific Article III mechanisms — life tenure, salary protection, the appointment/confirmation process — and how they balance independence with accountability.',
+        full: 'Strong Part C — you effectively connected Article III\'s design features (life tenure, salary protection, Senate confirmation) to the balance between judicial independence and democratic accountability.',
+        partial: 'Your Part C analysis is on the right track. Strengthen it by citing specific Article III provisions (life tenure "during good behavior," salary protection, Senate confirmation process) and explicitly linking each to the independence/accountability tension.',
+        miss: 'Part C: Article III balances independence (life tenure "during good behavior," salary protection from Congress) with accountability (presidential appointment + Senate confirmation means elected officials shape the Court\'s composition, and Congress can propose constitutional amendments to override decisions).'
+      },
+      apTip: 'On the real AP exam, always cite specific constitutional provisions (Article III, Article II §2) and case names. Labeling your parts clearly (A, B, C) and using precise language like "counter-majoritarian" signals AP-level thinking.'
+    },
+    { // 1 - Court Structure
+      partA: {
+        keywords: [['district','trial','original','first'],['appeals','circuit','appellate','review'],['supreme','final','highest']],
+        hint: 'Part A must describe all three tiers: District Courts (trial/original jurisdiction), Courts of Appeals (appellate review), and the Supreme Court (final arbiter). Name each level.',
+        full: 'Great Part A — you accurately described all three tiers of the federal court system: district courts as the trial courts, courts of appeals reviewing lower court decisions, and the Supreme Court as the final arbiter.',
+        partial: 'You identified some levels of the federal court system. For full credit, describe all three tiers and each one\'s specific role: 94 district courts (trial), 13 courts of appeals (appellate review), and 1 Supreme Court (final arbiter).',
+        miss: 'Part A: The federal court system has three levels — (1) 94 District Courts: trial courts with original jurisdiction; (2) 13 Courts of Appeals: review district court decisions, appellate jurisdiction only; (3) The Supreme Court: final arbiter of federal law, mostly appellate jurisdiction.'
+      },
+      partB: {
+        keywordsFor: [['original','first time','trial','hear','initial']],
+        keywordsAgainst: [['appellate','review','appeal','lower court','decision']],
+        hint: 'Part B needs a clear definition of BOTH original jurisdiction (court of first instance) AND appellate jurisdiction (reviewing lower court decisions), each with a concrete example.',
+        full: 'Excellent Part B — you correctly distinguished original jurisdiction (first to hear the case) from appellate jurisdiction (reviewing lower court decisions) and provided strong examples for each.',
+        partial: 'You defined the jurisdiction types but your examples need to be more specific. Try: original = Supreme Court hearing a dispute between two states; appellate = Court of Appeals reviewing a district court criminal conviction.',
+        miss: 'Part B: Original jurisdiction = authority to hear a case first (ex: Supreme Court hears suits between states). Appellate jurisdiction = authority to review a lower court\'s decision (ex: Courts of Appeals review district court rulings — no new evidence, only legal questions).'
+      },
+      partC: {
+        keywords: [['life tenure','good behavior','salary','independent','political pressure','federalist','hamilton','78'],['independence','insulate','impartial','neutral']],
+        hint: 'Part C should directly cite Article III features — life tenure "during good behavior" and salary protection — and connect them to the Founders\' goal of judicial independence (Federalist No. 78 is a bonus).',
+        full: 'Strong Part C — you clearly connected Article III\'s structural features (life tenure, salary protection) to the Founders\' goal of judicial independence from political pressure.',
+        partial: 'Your Part C mentions independence but needs stronger connection to specific Article III provisions. Cite life tenure ("during good behavior") and salary protection explicitly — these are the textual features that operationalize the independence goal.',
+        miss: 'Part C: Article III reflects the independence goal through: (1) life tenure "during good behavior" — judges cannot be removed for unpopular rulings; (2) salary protection — Congress cannot reduce judicial pay to punish judges. Hamilton argued in Federalist No. 78 these features make the judiciary a reliable guardian of constitutional rights.'
+      },
+      apTip: 'The AP exam frequently asks you to connect structural features to their purpose. Always ask: WHY was this design choice made? Life tenure isn\'t just a fact — it\'s a deliberate tool for independence. Show you understand the "why."'
+    },
+    { // 2 - Judicial Appointments
+      partA: {
+        keywords: [['article ii','president','nominate','senate','advice and consent','confirmation','two','steps']],
+        hint: 'Part A must cite Article II and describe both steps: presidential nomination AND Senate advice and consent (confirmation). Both steps are required for full credit.',
+        full: 'Great Part A — you correctly described the two-step constitutional process: presidential nomination under Article II and Senate confirmation through advice and consent.',
+        partial: 'Your Part A describes the general process but needs to explicitly cite Article II and name both steps: (1) presidential nomination and (2) Senate advice and consent.',
+        miss: 'Part A: Article II, Section 2 gives the president power to nominate federal judges, but nominees must be confirmed by the Senate through "Advice and Consent." This two-step process reflects checks and balances between the executive and legislative branches.'
+      },
+      partB: {
+        keywordsFor: [['policy','ideology','philosophy','originalism','living','shape','legacy','future']],
+        keywordsAgainst: [['senate','hearings','reject','refuse','filibuster','check','balance','veto','accountability']],
+        hint: 'Part B needs TWO things: (1) how nominees reflect presidential priorities (ideology/policy goals), and (2) how the Senate checks presidential power (hearings, rejection, holds). Be specific about both.',
+        full: 'Excellent Part B — you clearly explained both how presidents use nominations to advance policy goals (ideological alignment, legacy) and how the Senate exercises its checking function (confirmation hearings, rejection power, holds).',
+        partial: 'You addressed one side of Part B well. Develop the other: if you explained presidential motivations, also explain Senate checking mechanisms (hearings, rejections, the Bork precedent), and vice versa.',
+        miss: 'Part B: Presidential priorities: Presidents nominate ideologically aligned judges to shape jurisprudence for decades (legacy). Senate check: The Senate Judiciary Committee holds public hearings, can vote down nominees (e.g., Bork 1987), and has even refused to hold hearings (Garland 2016) — all powerful checks on presidential appointment power.'
+      },
+      partC: {
+        keywords: [['experience','aba','credentials','circuit','legal','professional','judge'],['race','gender','diversity','coalition','demographic','religion','geography','political','party']],
+        hint: 'Part C requires TWO distinct factors — one legal/professional (judicial experience, ABA rating, credentials) and one political/demographic (race, gender, party loyalty, geographic balance). Name both explicitly.',
+        full: 'Strong Part C — you effectively identified both a professional/legal factor and a political/demographic factor with clear explanations of why each matters in the selection process.',
+        partial: 'Your Part C identifies factors but blurs the distinction. Make sure one factor is explicitly professional/legal (e.g., prior federal judicial experience, ABA rating) and one is explicitly political/demographic (e.g., gender, race, party loyalty, coalition-building).',
+        miss: 'Part C: Legal/professional factor: prior judicial experience (circuit court service signals predictable judicial temperament and reduces confirmation risk). Political/demographic factor: race and gender — presidents consider demographic representation to build political coalitions and signal commitment to diversity (e.g., first Black woman Justice).'
+      },
+      apTip: 'When the FRQ asks you to "explain," you need more than just naming something — you need a because/therefore chain. "Presidents nominate ideologically aligned judges BECAUSE they want to shape jurisprudence BEYOND their term, THEREFORE nominations are highly political." That structure earns points.'
+    },
+    { // 3 - Checks on Courts
+      partA: {
+        keywords: [['amend','amendment','constitutional amendment','overturn','override','congress','jurisdiction','impeach','court packing','enforce','executive'],],
+        hint: 'Part A requires naming ONE specific constitutional mechanism (constitutional amendment process, congressional jurisdiction-stripping, impeachment of judges, presidential enforcement power) AND explaining how it limits the Court.',
+        full: 'Good Part A — you correctly identified a formal constitutional mechanism limiting the Supreme Court and explained how it operates as a check.',
+        partial: 'Your Part A names a limitation but needs a fuller explanation of the constitutional mechanism behind it. How exactly does it work? Which article/amendment authorizes it?',
+        miss: 'Part A example: Congress and the states can pass constitutional amendments to override Supreme Court decisions (Art. V). For example, the 16th Amendment reversed Pollock v. Farmers\' Loan (1895) which struck down the income tax. This is the most direct constitutional check on judicial interpretation.'
+      },
+      partB: {
+        keywordsFor: [['constrain','limit','precedent','stare decisis','consistency','stability','predictability','prior','bound']],
+        keywordsAgainst: [['overturn','overrule','change','evolve','empower','expand','strike down','reverse','brown','plessy']],
+        hint: 'Part B requires BOTH: how stare decisis CONSTRAINS the Court (must follow precedent, promotes stability) AND how it EMPOWERS the Court (precedents accumulate authority; ability to overturn gives the Court policy-making power).',
+        full: 'Excellent Part B — you captured both the constraining function of stare decisis (binding precedent promotes consistency and limits discretion) and its empowering dimension (the ability to set and overturn precedent gives the Court enormous policy influence).',
+        partial: 'Your Part B addresses one direction well. Make sure you explain the constraining side (lower courts must follow precedent; the Court itself feels pressure not to overturn without strong justification) AND the empowering side (precedents become authoritative law; strategic overturning reshapes policy for generations).',
+        miss: 'Part B: Constrains: stare decisis requires courts to follow precedent, promoting stability and predictability — the Court cannot simply reverse course without strong justification (e.g., it took 58 years to overturn Plessy). Empowers: once the Court sets precedent, it becomes the law of the land binding all lower courts, and the power to overturn (as in Brown v. Board) makes the Court a powerful policy-making institution.'
+      },
+      partC: {
+        keywords: [['marbury','mcculloch','lopez','heller','engel','nyt','times','brown','plessy','tinker','gideon','miranda','roe','dobbs','obergefell'],['federal','state','branch','congress','president','executive','legislature','balance','power','federalism']],
+        hint: 'Part C requires naming a SPECIFIC case AND explaining how it shifted power between federal/state governments OR between branches. Be precise: name the case, describe the holding, and explain the power shift.',
+        full: 'Strong Part C — you correctly named a specific case, described its holding, and clearly explained how the decision affected the balance of power in the constitutional system.',
+        partial: 'Your Part C references a case but needs a more explicit explanation of the power shift. State: what was the holding? And how did that directly affect federal vs. state power OR the balance among the three branches?',
+        miss: 'Part C example: In McCulloch v. Maryland (1819), the Court ruled states cannot tax federal institutions (affirming federal supremacy) AND that the Necessary and Proper Clause gives Congress broad implied powers. This dramatically expanded federal power over states, establishing the constitutional foundation for most modern federal programs.'
+      },
+      apTip: 'The AP exam loves "both sides" questions about judicial power. Practice framing stare decisis, judicial review, and judicial independence as having both limits AND strengths — showing nuance earns top scores on FRQs.'
+    }
+  ];
+
+  function scoreOfflineFRQ(promptIdx, answer) {
+    const rubric = frqRubrics[promptIdx];
+    const a = answer.toLowerCase();
+
+    // Score Part A: need both keyword groups present
+    let scoreA = 0;
+    const aGroups = rubric.partA.keywords;
+    const aHits = aGroups.filter(group => group.some(kw => a.includes(kw)));
+    if (aHits.length >= aGroups.length) scoreA = 1;
+    else if (aHits.length >= 1) scoreA = 0; // partial but still 0 for AP scoring
+
+    // Score Part B
+    let scoreB = 0;
+    if (rubric.partB.keywordsFor && rubric.partB.keywordsAgainst) {
+      const bFor = rubric.partB.keywordsFor[0].some(kw => a.includes(kw));
+      const bAgainst = rubric.partB.keywordsAgainst[0].some(kw => a.includes(kw));
+      if (bFor && bAgainst) scoreB = 2;
+      else if (bFor || bAgainst) scoreB = 1;
+    }
+
+    // Score Part C
+    let scoreC = 0;
+    const cGroups = rubric.partC.keywords;
+    const cHits = cGroups.filter(group => group.some(kw => a.includes(kw)));
+    if (cHits.length >= 2) scoreC = 2;
+    else if (cHits.length === 1) scoreC = 1;
+
+    const total = scoreA + scoreB + scoreC;
+    const wordCount = answer.trim().split(/\s+/).filter(Boolean).length;
+
+    // Build feedback text per part
+    const partAFeedback = scoreA === 1 ? rubric.partA.full :
+      aHits.length > 0 ? rubric.partA.partial : rubric.partA.miss;
+
+    let partBFeedback;
+    if (rubric.partB.keywordsFor) {
+      const bFor = rubric.partB.keywordsFor[0].some(kw => a.includes(kw));
+      const bAgainst = rubric.partB.keywordsAgainst[0].some(kw => a.includes(kw));
+      partBFeedback = (bFor && bAgainst) ? rubric.partB.hint.replace('needs TWO distinct','has ✓') :
+        (bFor || bAgainst) ? rubric.partB.partial : rubric.partB.miss;
+      if (scoreB === 2) partBFeedback = rubric.partB.full || rubric.partB.hint;
+      if (scoreB === 1) partBFeedback = rubric.partB.partial;
+      if (scoreB === 0) partBFeedback = rubric.partB.miss;
+    }
+
+    const partCFeedback = scoreC === 2 ? rubric.partC.full :
+      scoreC === 1 ? rubric.partC.partial : rubric.partC.miss;
+
+    // Strengths
+    const strengths = wordCount >= 100
+      ? 'Your response is well-developed with sufficient detail. ' + (total >= 3 ? 'You demonstrated knowledge of key concepts and AP terminology.' : 'You engaged substantively with the prompt.')
+      : 'You identified relevant concepts. For the AP exam, aim for 120–180 words minimum — more developed responses earn more points.';
+
+    // Improvements
+    const missedParts = [];
+    if (scoreA < 1) missedParts.push('Part A (definition + case identification)');
+    if (scoreB < 2) missedParts.push('Part B (both perspectives clearly labeled)');
+    if (scoreC < 2) missedParts.push('Part C (specific evidence + power analysis)');
+    const improvements = missedParts.length === 0
+      ? 'Excellent work — focus on using precise AP vocabulary (e.g., "counter-majoritarian," "stare decisis," "original jurisdiction") to signal exam readiness.'
+      : 'To improve: ' + missedParts.join('; ') + '. Always label your parts clearly (A, B, C) and use specific case names and constitutional articles as evidence.';
+
+    return { scoreA, scoreB, scoreC, totalScore: total, maxScore: 5,
+      partAFeedback, partBFeedback, partCFeedback, strengths, improvements, apTip: rubric.apTip };
+  }
+
+  // ── OFFLINE CASE EXPLORER ──────────────────────────────────────────────────
+  const caseDatabase = {
+    'marbury': {
+      name: 'Marbury v. Madison (1803)',
+      year: 1803, topic: 'Judicial Review',
+      facts: 'Outgoing President Adams appointed William Marbury as a Justice of the Peace in the final hours of his presidency. His Secretary of State (John Marshall, who later wrote the opinion) failed to deliver the commission. When Jefferson took office, his Secretary of State James Madison refused to deliver it.',
+      question: 'Did Marbury have a right to his commission, and could the Supreme Court order its delivery?',
+      holding: 'Chief Justice Marshall ruled that while Marbury was entitled to his commission, the Supreme Court lacked jurisdiction to order its delivery because the provision of the Judiciary Act of 1789 granting that power was unconstitutional — it conflicted with Article III\'s definition of the Court\'s original jurisdiction.',
+      significance: 'Established the doctrine of <strong>judicial review</strong> — the power of courts to strike down laws that conflict with the Constitution. Marshall\'s famous line: "It is emphatically the province and duty of the Judicial Department to say what the law is."',
+      apConnection: 'This is the single most important case in AP Gov. Know: (1) how Marshall established judicial review without directly confronting Jefferson, (2) the political genius of ruling against Marbury while claiming a larger power, (3) its connection to Federalist No. 78 (Hamilton\'s defense of judicial independence), and (4) that judicial review is NOT explicitly in the Constitution.',
+      frqTip: 'Any FRQ on judicial review, checks and balances, or the judiciary\'s role WILL likely reference this case. Be ready to explain both the facts AND the strategic reasoning behind Marshall\'s decision.'
+    },
+    'mcculloch': {
+      name: 'McCulloch v. Maryland (1819)',
+      year: 1819, topic: 'Federalism / Implied Powers',
+      facts: 'Maryland imposed a tax on the Second Bank of the United States. James McCulloch, the bank\'s cashier, refused to pay. Maryland argued Congress had no authority to create a national bank because it wasn\'t listed in the Constitution\'s enumerated powers.',
+      question: '(1) Did Congress have the power to create a national bank? (2) Could a state tax a federal institution?',
+      holding: '(1) YES — Congress has implied powers under the Necessary and Proper Clause to carry out its enumerated powers. Creating a bank is a legitimate means to execute powers like taxing, borrowing money, and regulating commerce. (2) NO — "the power to tax involves the power to destroy." States cannot tax federal institutions because federal law is supreme.',
+      significance: 'Established broad <strong>implied powers</strong> for Congress under the Necessary and Proper Clause and reinforced federal supremacy over states under the Supremacy Clause. Foundation for nearly all modern expansions of federal power.',
+      apConnection: 'Key for federalism FRQs. Know: (1) the Necessary and Proper Clause (Art. I §8) gives Congress implied powers beyond its enumerated list; (2) "the power to tax is the power to destroy" — states cannot interfere with federal functions; (3) this case is the constitutional basis for the modern federal government\'s extensive authority.',
+      frqTip: 'When asked about federalism or congressional power, cite McCulloch and connect it to the Necessary and Proper Clause. Example: "Congress\'s power to [regulate health care / create the Federal Reserve / etc.] derives from implied powers established in McCulloch v. Maryland."'
+    },
+    'lopez': {
+      name: 'United States v. Lopez (1995)',
+      year: 1995, topic: 'Commerce Clause / Federalism',
+      facts: 'Alfonso Lopez, a 12th-grader, brought a handgun to his San Antonio high school in violation of the federal Gun-Free School Zones Act. The federal government prosecuted under the Commerce Clause, arguing guns near schools affect interstate commerce.',
+      question: 'Did the Gun-Free School Zones Act exceed Congress\'s Commerce Clause power?',
+      holding: 'YES — the Supreme Court (5-4) struck down the Act. Gun possession at a school is a non-economic, local activity that does not "substantially affect" interstate commerce. For the first time in 60 years, the Court limited congressional Commerce Clause authority.',
+      significance: 'Reaffirmed that Congress\'s Commerce Clause power has <strong>limits</strong>. The Court identified three categories of activity Congress can regulate: (1) channels of interstate commerce, (2) instrumentalities of interstate commerce, (3) activities that substantially affect interstate commerce. Gun possession in school zones fell into none of these.',
+      apConnection: 'Critical for federalism balance-of-power questions. Shows the Court acting as a check on congressional power. Contrast with McCulloch (broad federal power) — Lopez shows the pendulum can swing back toward state authority. Know the "substantial effects" test.',
+      frqTip: 'Lopez is often paired with McCulloch on federalism FRQs. Use Lopez to show that federal power, while broad, is not unlimited — and that the Court will enforce those limits.'
+    },
+    'heller': {
+      name: 'District of Columbia v. Heller (2008)',
+      year: 2008, topic: '2nd Amendment / Individual Rights',
+      facts: 'Dick Heller, a D.C. special police officer, applied to register a handgun to keep at home and was denied. D.C. law banned handgun possession and required all firearms to be kept unloaded and disassembled. He challenged the law as a violation of the 2nd Amendment.',
+      question: 'Does the 2nd Amendment protect an individual\'s right to possess a firearm for traditionally lawful purposes, such as self-defense?',
+      holding: 'YES — the 2nd Amendment protects an <strong>individual right</strong> to possess firearms independent of service in a militia, particularly for self-defense in the home. D.C.\'s handgun ban violated this right.',
+      significance: 'Settled a long-standing debate: the 2nd Amendment protects individual gun ownership, not just militia service. However, the Court also noted that the right is not unlimited — regulations on carrying in certain places, by certain people, or of certain weapons remain constitutional.',
+      apConnection: 'Key for civil liberties and incorporation questions. Know: (1) Heller applied to federal law (D.C. is federal territory); (2) McDonald v. Chicago (2010) extended Heller to states via 14th Amendment incorporation; (3) this is an example of the Court using originalism to interpret the Constitution.',
+      frqTip: 'Always connect Heller to McDonald v. Chicago — together they establish the full scope of 2nd Amendment protections. Also note this as an example of originalist interpretation (Justice Scalia wrote the majority opinion).'
+    },
+    'mcdonald': {
+      name: 'McDonald v. City of Chicago (2010)',
+      year: 2010, topic: '2nd Amendment / Incorporation',
+      facts: 'Otis McDonald challenged Chicago\'s handgun ban following the Heller decision, arguing the 2nd Amendment should apply to states just as it applies to the federal government.',
+      question: 'Does the 2nd Amendment apply to state and local governments through the 14th Amendment?',
+      holding: 'YES — the 2nd Amendment is incorporated against state and local governments via the Due Process Clause of the 14th Amendment. States cannot ban handguns.',
+      significance: 'Extended Heller to all 50 states, completing the nationalization of the individual right to bear arms. Part of the broader <strong>selective incorporation</strong> doctrine through which most Bill of Rights protections have been applied to states.',
+      apConnection: 'Critical for understanding selective incorporation. Know that the 14th Amendment\'s Due Process Clause is the vehicle through which the Bill of Rights applies to states. McDonald + Heller together = complete 2nd Amendment framework for AP.',
+      frqTip: 'On incorporation questions, walk through the logic: the Bill of Rights originally applied only to the federal government (Barron v. Baltimore, 1833); the 14th Amendment changed this; McDonald illustrates how that process works.'
+    },
+    'engel': {
+      name: 'Engel v. Vitale (1962)',
+      year: 1962, topic: 'Establishment Clause / Religion in Schools',
+      facts: 'The New York State Board of Regents composed a brief nondenominational prayer for recitation in public schools: "Almighty God, we acknowledge our dependence upon Thee." The parents of 10 students sued, arguing it violated the Establishment Clause.',
+      question: 'Does state-sponsored prayer in public schools violate the Establishment Clause of the 1st Amendment?',
+      holding: 'YES — school-sponsored prayer violates the Establishment Clause even if it is nondenominational and student participation is voluntary. Government officials composing an official prayer constitutes an unconstitutional establishment of religion.',
+      significance: 'Established that the <strong>Establishment Clause</strong> prohibits government-sponsored religious activity in public schools. One of the most controversial decisions in Court history — launched decades of debate about religion\'s role in public life.',
+      apConnection: 'Key for 1st Amendment / civil liberties FRQs. Know the Establishment Clause test and how Engel is applied. Also understand that the Court incorporated the Establishment Clause to states (the school was a state institution). Contrast: students can still pray privately.',
+      frqTip: 'When discussing the Establishment Clause, use Engel to show the principle: government cannot sponsor, organize, or encourage religious practice — even nondenominationally. This comes up on both civil liberties FRQs and court power questions.'
+    },
+    'nyt': {
+      name: 'New York Times Co. v. United States (1971)',
+      year: 1971, topic: '1st Amendment / Prior Restraint / Free Press',
+      facts: 'The Nixon administration sought to stop the New York Times and Washington Post from publishing the "Pentagon Papers" — a classified Defense Department study of U.S. involvement in Vietnam. The government argued publication would endanger national security.',
+      question: 'Could the government prevent publication of the Pentagon Papers through prior restraint?',
+      holding: 'NO — the government failed to meet the heavy burden required to justify prior restraint. In a 6-3 per curiam decision, the Court ruled the injunction violated the 1st Amendment\'s protections for freedom of the press.',
+      significance: 'Strongly reaffirmed the presumption against <strong>prior restraint</strong> — government censorship of expression before it is published. The press has broad freedom to publish even sensitive government information unless the government can prove certain, direct, and immediate harm.',
+      apConnection: 'Essential for 1st Amendment FRQs on press freedom. Know: (1) prior restraint is the most serious 1st Amendment violation; (2) government bears an extremely heavy burden to justify it; (3) national security arguments alone are insufficient without proof of direct, immediate harm.',
+      frqTip: 'Pair NYT v. U.S. with the concept of "prior restraint" — governments may be able to punish speech after the fact, but they face a nearly insurmountable presumption against preventing it beforehand. This distinction is AP-exam gold.'
+    }
+  };
+
+  // Question answering logic
+  function answerCaseQuestion(q) {
+    const ql = q.toLowerCase();
+
+    // Find which case(s) are being asked about
+    const caseMatches = {
+      'marbury': ['marbury','1803'],
+      'mcculloch': ['mcculloch','maryland','implied power','necessary and proper','1819'],
+      'lopez': ['lopez','gun-free','school zone','1995'],
+      'heller': ['heller','district of columbia','d.c.','2008','second amendment','2nd amendment'],
+      'mcdonald': ['mcdonald','chicago','2010','incorporation'],
+      'engel': ['engel','vitale','prayer','school prayer','1962','establishment'],
+      'nyt': ['new york times','pentagon papers','prior restraint','1971','nyt']
+    };
+
+    let matchedKey = null;
+    for (const [key, keywords] of Object.entries(caseMatches)) {
+      if (keywords.some(kw => ql.includes(kw))) { matchedKey = key; break; }
+    }
+
+    if (!matchedKey) {
+      // Generic AP-focused answer
+      return `<p>I don't have a specific case matching your question in my database, but here are the <strong>AP Required Cases for the Judiciary</strong> I can help you with:</p>
+        <ul style="margin:10px 0 0 16px; line-height:2;">
+          <li><em>Marbury v. Madison</em> (1803) — Judicial Review</li>
+          <li><em>McCulloch v. Maryland</em> (1819) — Implied Powers / Federalism</li>
+          <li><em>United States v. Lopez</em> (1995) — Commerce Clause Limits</li>
+          <li><em>District of Columbia v. Heller</em> (2008) — 2nd Amendment</li>
+          <li><em>McDonald v. Chicago</em> (2010) — Incorporation</li>
+          <li><em>Engel v. Vitale</em> (1962) — Establishment Clause</li>
+          <li><em>New York Times v. United States</em> (1971) — Prior Restraint</li>
+        </ul>
+        <p style="margin-top:12px;">Click one of the quick buttons above or rephrase your question to include the case name.</p>`;
+    }
+
+    const c = caseDatabase[matchedKey];
+
+    // Determine question type and return targeted answer
+    const isFacts = ql.includes('fact') || ql.includes('what happened') || ql.includes('background') || ql.includes('story');
+    const isHolding = ql.includes('hold') || ql.includes('decide') || ql.includes('rule') || ql.includes('outcome') || ql.includes('result');
+    const isSignificance = ql.includes('significant') || ql.includes('matter') || ql.includes('important') || ql.includes('impact') || ql.includes('why');
+    const isFRQ = ql.includes('frq') || ql.includes('exam') || ql.includes('ap') || ql.includes('test') || ql.includes('write') || ql.includes('essay');
+    const isAll = ql.includes('everything') || ql.includes('all') || ql.includes('tell me about') || ql.includes('need to know') || ql.includes('overview') || ql.includes('summary');
+
+    if (isAll || (!isFacts && !isHolding && !isSignificance && !isFRQ)) {
+      return `
+        <div style="margin-bottom:14px;"><strong style="font-size:16px;">${c.name}</strong> &nbsp;<span style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase;">${c.topic}</span></div>
+        <div style="margin-bottom:12px;"><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#b5540a;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px;">Background</span>${c.facts}</div>
+        <div style="margin-bottom:12px;"><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#b5540a;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px;">Constitutional Question</span><em>${c.question}</em></div>
+        <div style="margin-bottom:12px;"><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#b5540a;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px;">Holding</span>${c.holding}</div>
+        <div style="margin-bottom:12px;"><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#b5540a;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px;">Significance</span>${c.significance}</div>
+        <div style="margin-bottom:12px;"><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--blue);text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px;">AP Exam Connection</span>${c.apConnection}</div>
+        <div style="background:var(--ink);color:var(--parchment);padding:12px 16px;border-left:3px solid var(--gold);margin-top:4px;"><span style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--gold);text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px;">FRQ Tip</span>${c.frqTip}</div>`;
+    }
+    if (isFacts) return `<strong>${c.name} — Background</strong><p style="margin-top:8px;">${c.facts}</p><p style="margin-top:8px;"><em>Constitutional question: ${c.question}</em></p>`;
+    if (isHolding) return `<strong>${c.name} — Holding</strong><p style="margin-top:8px;">${c.holding}</p>`;
+    if (isSignificance) return `<strong>${c.name} — Significance</strong><p style="margin-top:8px;">${c.significance}</p><p style="margin-top:10px;">${c.apConnection}</p>`;
+    if (isFRQ) return `<strong>${c.name} — AP Exam & FRQ Guide</strong><p style="margin-top:8px;">${c.apConnection}</p><div style="background:var(--ink);color:var(--parchment);padding:12px 16px;border-left:3px solid var(--gold);margin-top:12px;"><span style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--gold);text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px;">FRQ Tip</span>${c.frqTip}</div>`;
+  }
 
   function quickCase(caseName) {
-    document.getElementById('caseQuestion').value = `What do I need to know about ${caseName} for the AP exam?`;
+    document.getElementById('caseQuestion').value = `Tell me everything I need to know about ${caseName} for the AP exam`;
     exploreCase();
   }
+
+  let caseConversationHistory = [];
 
   async function exploreCase() {
     const q = document.getElementById('caseQuestion').value.trim();
     if (!q) return;
-    lastCaseContext = q;
-    caseConversationHistory = [{ role: 'user', content: q }];
-    await runCaseQuery(true);
+    caseConversationHistory = [];
+    document.getElementById('caseAnswerArea').style.display = 'block';
+    document.getElementById('caseAnswerContent').innerHTML = '';
+    document.getElementById('caseAnswerContent').style.display = 'none';
+    document.getElementById('caseChatHistory').style.display = 'none';
+    document.getElementById('caseLoadingMsg').style.display = 'block';
+    document.getElementById('caseLoadingMsg').className = 'ai-loading';
+
+    if (navigator.onLine) {
+      document.getElementById('caseLoadingMsg').textContent = '⚡ Looking up case with AI...';
+      const aiAnswer = await fetchCaseFromAI(q);
+      if (aiAnswer) {
+        caseConversationHistory.push({ role: 'user', content: q });
+        caseConversationHistory.push({ role: 'assistant', content: aiAnswer });
+        showCaseAnswer(q, aiAnswer, true);
+        return;
+      }
+    }
+
+    // Offline fallback
+    document.getElementById('caseLoadingMsg').textContent = 'Looking up case...';
+    await new Promise(r => setTimeout(r, 300));
+    const answer = answerCaseQuestion(q);
+    showCaseAnswer(q, answer, false);
   }
 
   async function followUpCase() {
     const q = document.getElementById('caseFollowup').value.trim();
     if (!q) return;
-    caseConversationHistory.push({ role: 'user', content: q });
     document.getElementById('caseFollowup').value = '';
-    await runCaseQuery(false);
-  }
 
-  async function runCaseQuery(isFirst) {
-    document.getElementById('caseAnswerArea').style.display = 'block';
-    document.getElementById('caseLoadingMsg').style.display = 'block';
-    document.getElementById('caseLoadingMsg').className = 'ai-loading';
-    document.getElementById('caseLoadingMsg').textContent = 'Researching case...';
-    if (isFirst) {
-      document.getElementById('caseAnswerContent').style.display = 'none';
-      document.getElementById('caseAnswerContent').innerHTML = '';
-      document.getElementById('caseChatHistory').style.display = 'none';
+    if (navigator.onLine && caseConversationHistory.length > 0) {
+      caseConversationHistory.push({ role: 'user', content: q });
+      const aiAnswer = await fetchCaseFromAI(null, caseConversationHistory);
+      if (aiAnswer) {
+        caseConversationHistory.push({ role: 'assistant', content: aiAnswer });
+        appendCaseAnswer('Follow-up: ' + q, aiAnswer);
+        return;
+      }
     }
 
-    const systemPrompt = `You are an AP US Government & Politics tutor specializing in Supreme Court cases. 
-    Give clear, AP-exam-focused answers. Format your response with these HTML sections where relevant:
-    - Use <strong> for key terms and case names
-    - Use bullet points sparingly and only when listing distinct items
-    - Keep responses focused: facts, holding, significance, AP connection
-    - Always mention how the case relates to AP exam topics (judicial review, federalism, civil liberties, etc.)
-    - Be concise but thorough — a student should be able to use this to write an FRQ`;
+    const answer = answerCaseQuestion(q);
+    appendCaseAnswer('Follow-up: ' + q, answer);
+  }
 
+  async function fetchCaseFromAI(question, history) {
     try {
+      const messages = history || [{ role: 'user', content: question }];
       const res = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'claude-sonnet-4-20250514',
           max_tokens: 1000,
-          system: systemPrompt,
-          messages: caseConversationHistory
+          system: `You are an AP US Government & Politics tutor specializing in Supreme Court cases. Give AP-exam-focused answers. Use <strong> for key terms. Keep responses concise but thorough — focused on facts, holding, significance, and AP exam relevance. Always mention how the case connects to AP exam topics.`,
+          messages
         })
       });
+      if (!res.ok) return null;
       const data = await res.json();
-      const reply = data.content.map(b => b.text || '').join('');
-      caseConversationHistory.push({ role: 'assistant', content: reply });
+      return data.content.map(b => b.text || '').join('');
+    } catch(e) { return null; }
+  }
 
-      document.getElementById('caseLoadingMsg').style.display = 'none';
+  function showCaseAnswer(q, answer, isAI) {
+    document.getElementById('caseLoadingMsg').style.display = 'none';
+    document.getElementById('caseAnswerContent').style.display = 'block';
+    document.getElementById('caseChatHistory').style.display = 'block';
+    const badge = isAI
+      ? `<span style="font-family:'IBM Plex Mono',monospace;font-size:9px;padding:2px 7px;background:#1a3a5c;color:white;letter-spacing:0.1em;text-transform:uppercase;margin-left:8px;">⚡ AI</span>`
+      : `<span style="font-family:'IBM Plex Mono',monospace;font-size:9px;padding:2px 7px;background:var(--ink);color:#aaa;letter-spacing:0.1em;text-transform:uppercase;margin-left:8px;">📋 Offline</span>`;
+    document.getElementById('caseAnswerContent').innerHTML = `
+      <div class="case-answer-block">
+        <div class="case-q-label">Q: ${q} ${badge}</div>
+        <div style="margin-top:8px;">${answer}</div>
+      </div>`;
+  }
 
-      if (isFirst) {
-        document.getElementById('caseAnswerContent').style.display = 'block';
-        document.getElementById('caseAnswerContent').innerHTML = `
-          <div class="case-answer-block">
-            <div class="case-q-label">Q: ${document.getElementById('caseQuestion').value}</div>
-            <div>${reply}</div>
-          </div>`;
-        document.getElementById('caseChatHistory').style.display = 'block';
-      } else {
-        const newBlock = document.createElement('div');
-        newBlock.className = 'case-answer-block';
-        newBlock.innerHTML = `<div class="case-q-label">Follow-up</div><div>${reply}</div>`;
-        document.getElementById('caseAnswerContent').appendChild(newBlock);
-      }
-    } catch(e) {
-      document.getElementById('caseLoadingMsg').className = '';
-      document.getElementById('caseLoadingMsg').textContent = 'Error fetching response. Please try again.';
-    }
+  function appendCaseAnswer(label, answer) {
+    const newBlock = document.createElement('div');
+    newBlock.className = 'case-answer-block';
+    newBlock.innerHTML = `<div class="case-q-label">${label}</div><div style="margin-top:8px;">${answer}</div>`;
+    document.getElementById('caseAnswerContent').appendChild(newBlock);
+    newBlock.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 </script>
 </body>
